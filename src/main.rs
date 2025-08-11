@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use esp_idf_hal::rmt::VariableLengthSignal;
+use esp_idf_hal::rmt::{VariableLengthSignal};
 use esp_idf_hal::{
     delay::FreeRtos,
     prelude::Peripherals,
@@ -27,7 +27,6 @@ use esp_idf_svc::{
     nvs::EspDefaultNvsPartition,
     wifi::{BlockingWifi, EspWifi},
 };
-
 use log::info;
 use serde::Deserialize;
 
@@ -48,86 +47,81 @@ pub fn main() -> Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
+    let config = TransmitConfig::new().clock_divider(1);
+
+    // Onboard RGB LED pin
+    let mut tx_onboard =
+        TxRmtDriver::new(peripherals.rmt.channel0, peripherals.pins.gpio8, &config)?;
+    let timings_ws2812 = [350, 800, 700, 600];
+    let onboard_led_state = Arc::new(RwLock::new(Vec::new()));
+
+    onboard_led_state.write().unwrap().push(Rgb::new(8, 0, 0));
+
+    // RGB Stripe pin
+    let mut tx_stripe_9 =
+        TxRmtDriver::new(peripherals.rmt.channel1, peripherals.pins.gpio9, &config)?;
+    let timings_ws2812b = [400, 800, 850, 450];
+    let rgb_stripe_state = Arc::new(RwLock::new(Vec::new()));
+
+    // cyan at 100% brightness
+    for _ in 0..50 {
+        rgb_stripe_state
+            .write()
+            .unwrap()
+            .push(Rgb::from_hsv(135, 100, 100)?);
+    }
+
+    send_led_signal(
+        &onboard_led_state.read().unwrap(),
+        &mut tx_onboard,
+        &timings_ws2812,
+    )?;
+
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
         sys_loop,
     )?;
-
     connect_wifi(&mut wifi)?;
 
-    let mut server = create_server()?;
+    onboard_led_state.write().unwrap().clear();
+    onboard_led_state.write().unwrap().push(Rgb::new(8, 0, 4));
+    send_led_signal(
+        &onboard_led_state.read().unwrap(),
+        &mut tx_onboard,
+        &timings_ws2812,
+    )?;
 
-    let led_state = Arc::new(RwLock::new(Vec::new()));
+    #[allow(unused_mut)]
+    let mut server = setup_http_server(&rgb_stripe_state)?;
 
-    // 3 seconds white at 100% brightness
-    for _ in 0..50 {
-        led_state.write().unwrap().push(Rgb::new(255, 255, 255));
-    }
-
-    let led_clone = led_state.clone();
-    server.fn_handler::<anyhow::Error, _>("/post", Method::Post, move |mut req| {
-        let len = req.content_len().unwrap_or(0) as usize;
-
-        if len > MAX_LEN {
-            req.into_status_response(413)?
-                .write_all("Request too big".as_bytes())?;
-            return Ok(());
-        }
-
-        let mut buf = vec![0; len];
-        req.read_exact(&mut buf)?;
-        let mut resp = req.into_ok_response()?;
-
-        if let Ok(form) = serde_json::from_slice::<FormData>(&buf) {
-            let mut led_state = led_clone.write().unwrap();
-            led_state.clear();
-
-            if form.rainbow {
-                // Generate a rainbow effect
-                for i in 0..360 {
-                    let rgb = Rgb::from_hsv(i, 100, 100)?;
-                    led_state.push(rgb);
-                }
-            } else {
-                for led in form.ledstates {
-                    led_state.push(Rgb::new(led[0], led[1], led[2]));
-                }
-            }
-        } else {
-            resp.write_all("JSON error".as_bytes())?;
-        }
-
-        Ok(())
-    })?;
-
-    // Keep wifi and the server running beyond when main() returns (forever)
-    // Do not call this if you ever want to stop or access them later.
-    // Otherwise you can either add an infinite loop so the main task
-    // never returns, or you can move them to another thread.
-    // https://doc.rust-lang.org/stable/core/mem/fn.forget.html
     core::mem::forget(wifi);
     core::mem::forget(server);
 
-    // Onboard RGB LED pin
-    // ESP32-C3-DevKitC-02 gpio8, ESP32-C3-DevKit-RUST-1 gpio2
-    let led = peripherals.pins.gpio9;
-    let channel = peripherals.rmt.channel0;
-    let config = TransmitConfig::new().clock_divider(1);
-    let mut tx = TxRmtDriver::new(channel, led, &config)?;
+    onboard_led_state.write().unwrap().clear();
+    onboard_led_state.write().unwrap().push(Rgb::new(0, 0, 8));
+    send_led_signal(
+        &onboard_led_state.read().unwrap(),
+        &mut tx_onboard,
+        &timings_ws2812,
+    )?;
 
     loop {
-        FreeRtos::delay_ms(100);
-        neopixel(&led_state.read().unwrap(), &mut tx)?
+        FreeRtos::delay_ms(50);
+        send_led_signal(
+            &rgb_stripe_state.read().unwrap(),
+            &mut tx_stripe_9,
+            &timings_ws2812b,
+        )?
     }
 }
 
-fn neopixel(rgb: &Vec<Rgb>, tx: &mut TxRmtDriver) -> Result<()> {
+fn send_led_signal(rgb: &[Rgb], tx: &mut TxRmtDriver, timings: &[u64; 4]) -> Result<()> {
     let ticks_hz = tx.counter_clock()?;
     let (t0h, t0l, t1h, t1l) = (
-        Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(400))?,
-        Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(800))?,
-        Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(850))?,
-        Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(450))?,
+        Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(timings[0]))?,
+        Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(timings[1]))?,
+        Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(timings[2]))?,
+        Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(timings[3]))?,
     );
     let mut signal = VariableLengthSignal::new();
     for color in rgb {
@@ -145,6 +139,7 @@ fn neopixel(rgb: &Vec<Rgb>, tx: &mut TxRmtDriver) -> Result<()> {
     tx.start_blocking(&signal)?;
     Ok(())
 }
+#[derive(Copy, Clone)]
 struct Rgb {
     r: u8,
     g: u8,
@@ -155,8 +150,8 @@ impl Rgb {
     pub fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
-    /// Converts hue, saturation, value to RGB
 
+    /// Converts hue, saturation, value to RGB
     #[allow(dead_code)]
     pub fn from_hsv(h: u32, s: u32, v: u32) -> Result<Self> {
         if h > 360 || s > 100 || v > 100 {
@@ -208,6 +203,49 @@ fn create_server() -> Result<EspHttpServer<'static>> {
     };
 
     Ok(EspHttpServer::new(&server_configuration)?)
+}
+
+fn setup_http_server(led_state: &'_ Arc<RwLock<Vec<Rgb>>>) -> Result<EspHttpServer<'_>, anyhow::Error> {
+
+    let mut server = create_server()?;
+
+    let led_clone = led_state.clone();
+    server.fn_handler::<anyhow::Error, _>("/post", Method::Post, move |mut req| {
+        let len = req.content_len().unwrap_or(0) as usize;
+
+        if len > MAX_LEN {
+            req.into_status_response(413)?
+                .write_all("Request too big".as_bytes())?;
+            return Ok(());
+        }
+
+        let mut buf = vec![0; len];
+        req.read_exact(&mut buf)?;
+        let mut resp = req.into_ok_response()?;
+
+        if let Ok(form) = serde_json::from_slice::<FormData>(&buf) {
+            let mut led_state = led_clone.write().unwrap();
+            led_state.clear();
+
+            if form.rainbow {
+                // Generate a rainbow effect
+                for i in 0..360 {
+                    let rgb = Rgb::from_hsv(i, 100, 100)?;
+                    led_state.push(rgb);
+                }
+            } else {
+                for led in form.ledstates {
+                    led_state.push(Rgb::new(led[0], led[1], led[2]));
+                }
+            }
+        } else {
+            resp.write_all("JSON error".as_bytes())?;
+        }
+
+        Ok(())
+    })?;
+
+    Ok(server)
 }
 
 fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
