@@ -217,5 +217,6 @@ This project is licensed under the Apache 2.0 License - see [LICENSE](LICENSE) f
 
 ## Acknowledgments
 
+- Spezifisch [Govee H619A Blogpost](https://spezifisch.codeberg.page/posts/2023-03-13/govee-rgb-strip-h619a-part-1-investigation) for his investigation on Govee strips and that they use WS2812B as their internal protocol
 - ESP-RS community for excellent Rust support on ESP32
 - Espressif for those cheap and handy chips and the ESP-IDF framework
