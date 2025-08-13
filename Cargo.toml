@@ -1,5 +1,5 @@
 [package]
-name = "esp32-led-test"
+name = "ws2812-led-control"
 version = "0.1.0"
 authors = ["klassenserver7b <klassenserver7bwin10@gmail.com>"]
 edition = "2021"
@@ -7,7 +7,7 @@ resolver = "2"
 rust-version = "1.77"
 
 [[bin]]
-name = "esp32-led-test"
+name = "ws2812-led-control"
 harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
 
 [profile.release]
