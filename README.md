@@ -174,6 +174,9 @@ cargo build --target riscv32imac-esp-espidf
 cargo espflash flash --target riscv32imac-esp-espidf --partition-table partitions.csv --monitor
 ```
 
+If you have a greater flashsize and want to build a bigger binary change [partitiontable.csv](partitiontable.csv).
+For the specs how to do that read [here](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/api-guides/partition-tables.html).
+
 ## Troubleshooting
 
 ### Common Issues
