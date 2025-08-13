@@ -4,45 +4,56 @@
 #![allow(unknown_lints)]
 #![allow(unexpected_cfgs)]
 
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use esp_idf_hal::rmt::{VariableLengthSignal};
+use esp_idf_hal::rmt::VariableLengthSignal;
 use esp_idf_hal::{
     delay::FreeRtos,
     prelude::Peripherals,
     rmt::{config::TransmitConfig, PinState, Pulse, TxRmtDriver},
 };
 
+use embedded_svc::wifi::AuthMethod;
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
-use embedded_svc::{
-    http::{Headers, Method},
-    io::{Read, Write},
-    wifi::AuthMethod,
-};
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
-    http::server::EspHttpServer,
     nvs::EspDefaultNvsPartition,
     wifi::{BlockingWifi, EspWifi},
 };
-use log::info;
-use serde::Deserialize;
+use log::{info, warn};
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
 
-// Max payload length
-const MAX_LEN: usize = 768;
-
-// Need lots of stack to parse JSON
-const STACK_SIZE: usize = 10240;
-
-pub fn main() -> Result<()> {
-    esp_idf_hal::sys::link_patches();
+fn main() -> Result<(), anyhow::Error> {
+    esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    // `async-io` uses the ESP IDF `eventfd` syscall to implement async IO.
+    // If you use `tokio`, you still have to do the same as it also uses the `eventfd` syscall
+    let _mounted_eventfs = esp_idf_svc::io::vfs::MountedEventfs::mount(5)?;
+
+    // This thread is necessary because the ESP IDF main task thread is running with a very low priority that cannot be raised
+    // (lower than the hidden posix thread in `async-io`)
+    // As a result, the main thread is constantly starving because of the higher prio `async-io` thread
+    //
+    // To use async networking IO, make your `main()` minimal by just spawning all work in a new thread
+    thread::Builder::new()
+        .stack_size(60000)
+        .spawn(run_main)
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+
+    Ok(())
+}
+
+pub fn run_main() -> Result<()> {
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
@@ -53,22 +64,21 @@ pub fn main() -> Result<()> {
     let mut tx_onboard =
         TxRmtDriver::new(peripherals.rmt.channel0, peripherals.pins.gpio8, &config)?;
     let timings_ws2812 = [350, 800, 700, 600];
-    let onboard_led_state = Arc::new(RwLock::new(Vec::new()));
-
+    let onboard_led_state = Arc::new(RwLock::new(Vec::with_capacity(1)));
     onboard_led_state.write().unwrap().push(Rgb::new(8, 0, 0));
 
     // RGB Stripe pin
-    let mut tx_stripe_9 =
-        TxRmtDriver::new(peripherals.rmt.channel1, peripherals.pins.gpio9, &config)?;
+    let mut tx_stripe = TxRmtDriver::new(peripherals.rmt.channel1, peripherals.pins.gpio9, &config)?;
+
     let timings_ws2812b = [400, 800, 850, 450];
-    let rgb_stripe_state = Arc::new(RwLock::new(Vec::new()));
+    let rgb_stripe_state = Arc::new(RwLock::new(Vec::with_capacity(50)));
 
     // cyan at 100% brightness
     for _ in 0..50 {
         rgb_stripe_state
             .write()
             .unwrap()
-            .push(Rgb::from_hsv(135, 100, 100)?);
+            .push(Rgb::from_hsv(150, 100, 13)?);
     }
 
     send_led_signal(
@@ -83,35 +93,110 @@ pub fn main() -> Result<()> {
     )?;
     connect_wifi(&mut wifi)?;
 
-    onboard_led_state.write().unwrap().clear();
-    onboard_led_state.write().unwrap().push(Rgb::new(8, 0, 4));
+    onboard_led_state.write().unwrap()[0] = Rgb::new(8, 0, 4);
     send_led_signal(
         &onboard_led_state.read().unwrap(),
         &mut tx_onboard,
         &timings_ws2812,
     )?;
 
-    #[allow(unused_mut)]
-    let mut server = setup_http_server(&rgb_stripe_state)?;
-
     core::mem::forget(wifi);
-    core::mem::forget(server);
 
-    onboard_led_state.write().unwrap().clear();
-    onboard_led_state.write().unwrap().push(Rgb::new(0, 0, 8));
     send_led_signal(
-        &onboard_led_state.read().unwrap(),
+        &rgb_stripe_state.read().unwrap(),
+        &mut tx_stripe,
+        &timings_ws2812b,
+    )?;
+
+    let onboard_led_clone = onboard_led_state.clone();
+    let rgb_stripe_clone = rgb_stripe_state.clone();
+
+    let _server = create_udp_server(
+        onboard_led_clone,
+        rgb_stripe_clone,
+        tx_onboard,
+        tx_stripe,
+        timings_ws2812,
+        timings_ws2812b,
+    );
+
+    loop {
+        FreeRtos::delay_ms(50);
+    }
+}
+
+fn create_udp_server(
+    onboard_led_state_lock: Arc<RwLock<Vec<Rgb>>>,
+    rgb_stripe_state_lock: Arc<RwLock<Vec<Rgb>>>,
+    mut tx_onboard: TxRmtDriver,
+    mut tx_stripe: TxRmtDriver,
+    timings_ws2812: [u64; 4],
+    timings_ws2812b: [u64; 4],
+) -> Result<(), anyhow::Error> {
+    let addr = "0.0.0.0:5568".to_socket_addrs()?.next().unwrap();
+    let udp_socket = UdpSocket::bind(addr)?;
+
+    info!("Created UDP server on {}", addr);
+
+    onboard_led_state_lock.write().unwrap()[0] = Rgb::new(0, 0, 8);
+    send_led_signal(
+        &onboard_led_state_lock.read().unwrap(),
         &mut tx_onboard,
         &timings_ws2812,
     )?;
 
     loop {
-        FreeRtos::delay_ms(50);
+        let mut buf = [0u8; 638];
+        let (size, addr) = udp_socket.recv_from(&mut buf)?;
+        info!("Received {} bytes from {}", size, addr);
+
+        if !(125..=638).contains(&size) {
+            warn!("Received invalid packet size: {}", size);
+            continue;
+        }
+
+        let universe = u16::from_be_bytes(buf[113..=114].try_into().unwrap());
+
+        let property_value_count = u16::from_be_bytes(buf[123..=124].try_into().unwrap());
+
+        if size < 125 + property_value_count as usize {
+            warn!(
+                "Received packet with insufficient size for property values: {}",
+                size
+            );
+            continue;
+        }
+        let property_values = &buf[125..(125 + property_value_count as usize)];
+
+        {
+            let mut rgb_stripe_state = rgb_stripe_state_lock.write().unwrap();
+            info!(
+                "updating rgb leds based on universe {} from {}",
+                universe, addr
+            );
+
+            for (i, chunk) in property_values.chunks(3).enumerate() {
+                if i >= rgb_stripe_state.len() {
+                    info!(
+                        "got data for more than {} leds ({} values)",
+                        i,
+                        property_value_count - 1
+                    );
+                    break;
+                }
+                rgb_stripe_state[i] =
+                    Rgb::from_slice(chunk.try_into().expect("slice with incorrect length"));
+            }
+        }
+        info!("updating rgb stripe color");
+
         send_led_signal(
-            &rgb_stripe_state.read().unwrap(),
-            &mut tx_stripe_9,
+            &rgb_stripe_state_lock.read().unwrap(),
+            &mut tx_stripe,
             &timings_ws2812b,
-        )?
+        )?;
+
+        info!("updated rgb stripe color");
     }
 }
 
@@ -151,6 +236,14 @@ impl Rgb {
         Self { r, g, b }
     }
 
+    pub fn from_slice(rgb: &[u8; 3]) -> Self {
+        Self {
+            r: rgb[0],
+            g: rgb[1],
+            b: rgb[2],
+        }
+    }
+
     /// Converts hue, saturation, value to RGB
     #[allow(dead_code)]
     pub fn from_hsv(h: u32, s: u32, v: u32) -> Result<Self> {
@@ -188,64 +281,6 @@ impl From<&Rgb> for u32 {
     fn from(rgb: &Rgb) -> Self {
         (rgb.g as u32) | ((rgb.r as u32) << 8) | ((rgb.b as u32) << 16)
     }
-}
-
-#[derive(Deserialize)]
-struct FormData {
-    rainbow: bool,
-    ledstates: Vec<[u8; 3]>,
-}
-
-fn create_server() -> Result<EspHttpServer<'static>> {
-    let server_configuration = esp_idf_svc::http::server::Configuration {
-        stack_size: STACK_SIZE,
-        ..Default::default()
-    };
-
-    Ok(EspHttpServer::new(&server_configuration)?)
-}
-
-fn setup_http_server(led_state: &'_ Arc<RwLock<Vec<Rgb>>>) -> Result<EspHttpServer<'_>, anyhow::Error> {
-
-    let mut server = create_server()?;
-
-    let led_clone = led_state.clone();
-    server.fn_handler::<anyhow::Error, _>("/post", Method::Post, move |mut req| {
-        let len = req.content_len().unwrap_or(0) as usize;
-
-        if len > MAX_LEN {
-            req.into_status_response(413)?
-                .write_all("Request too big".as_bytes())?;
-            return Ok(());
-        }
-
-        let mut buf = vec![0; len];
-        req.read_exact(&mut buf)?;
-        let mut resp = req.into_ok_response()?;
-
-        if let Ok(form) = serde_json::from_slice::<FormData>(&buf) {
-            let mut led_state = led_clone.write().unwrap();
-            led_state.clear();
-
-            if form.rainbow {
-                // Generate a rainbow effect
-                for i in 0..360 {
-                    let rgb = Rgb::from_hsv(i, 100, 100)?;
-                    led_state.push(rgb);
-                }
-            } else {
-                for led in form.ledstates {
-                    led_state.push(Rgb::new(led[0], led[1], led[2]));
-                }
-            }
-        } else {
-            resp.write_all("JSON error".as_bytes())?;
-        }
-
-        Ok(())
-    })?;
-
-    Ok(server)
 }
 
 fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {

@@ -28,8 +28,6 @@ esp-idf-svc = "0.51"
 esp-idf-hal = { version = "0.45.2", features = ["rmt-legacy"]}
 embedded-svc = "0.28.1"
 anyhow = "1.0.98"
-serde_json = "1.0.142"
-serde = { version = "1.0.219", features = ["derive"] }
 log = "0.4.27"
 
 
