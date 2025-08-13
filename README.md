@@ -142,7 +142,7 @@ and  [WS2812 Datasheet](https://cdn-shop.adafruit.com/datasheets/WS2812.pdf)
    - **RGB Order**: RGB
    - **Universe Size**: 512
 
-![OpenRGB E1.31 Device Configuration](https://github.com/user-attachments/assets/7e4a1722-f17d-4971-bd17-de16c4feb7bd>)
+![OpenRGB E1.31 Device Configuration](https://github.com/user-attachments/assets/7e4a1722-f17d-4971-bd17-de16c4feb7bd)
 
 ## Development
 
