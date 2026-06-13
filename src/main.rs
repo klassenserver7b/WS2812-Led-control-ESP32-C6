@@ -112,14 +112,14 @@ pub fn run_main() -> Result<()> {
     let onboard_led_clone = onboard_led_state.clone();
     let rgb_stripe_clone = rgb_stripe_state.clone();
 
-    // let _server = create_udp_server(
-    //     onboard_led_clone,
-    //     rgb_stripe_clone,
-    //     tx_onboard,
-    //     tx_stripe,
-    //     timings_ws2812,
-    //     timings_ws2812b,
-    // );
+    let _server = create_udp_server(
+        onboard_led_clone,
+        rgb_stripe_clone,
+        tx_onboard,
+        tx_stripe,
+        timings_ws2812,
+        timings_ws2812b,
+    );
 
     loop {
         FreeRtos::delay_ms(50);
