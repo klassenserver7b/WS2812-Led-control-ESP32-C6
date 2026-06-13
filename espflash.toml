@@ -1,5 +1,5 @@
 [idf_format_args]
 partition_table = "partitions.csv"
 [flash]
-size = "4MB"
+size = "8MB"
 frequency = "80MHz"

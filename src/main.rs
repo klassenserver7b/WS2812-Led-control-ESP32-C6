@@ -18,7 +18,10 @@ use esp_idf_hal::{
 use embedded_svc::wifi::AuthMethod;
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_hal::rmt::{TxRmtDriver, VariableLengthSignal};
+use esp_idf_hal::rmt::config::{Loop, TxChannelConfig};
+use esp_idf_hal::rmt::encoder::CopyEncoder;
+use esp_idf_hal::rmt::{PulseTicks, Symbol, TxChannelDriver};
+use esp_idf_hal::units::Hertz;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     nvs::EspDefaultNvsPartition,
@@ -28,6 +31,9 @@ use log::{info, warn};
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
+
+const RMT_RESOLUTION: Hertz = Hertz(10_000_000); // 10MHz resolution, 1 tick = 0.1us
+const DELAY_DURATION: Duration = Duration::from_millis(250);
 
 fn main() -> Result<(), anyhow::Error> {
     esp_idf_svc::sys::link_patches();
@@ -47,10 +53,7 @@ fn main() -> Result<(), anyhow::Error> {
         .spawn(run_main)
         .unwrap()
         .join()
-        .unwrap()
-        .unwrap();
-
-    Ok(())
+        .map_err(|e| anyhow::anyhow!("Main thread panicked: {:?}", e))?
 }
 
 pub fn run_main() -> Result<()> {
@@ -58,19 +61,27 @@ pub fn run_main() -> Result<()> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    let config = TransmitConfig::new().clock_divider(1);
+    let config = TxChannelConfig {
+        resolution: RMT_RESOLUTION,
+        ..Default::default()
+    };
 
-    // Onboard RGB LED pin
-    let mut tx_onboard =
-        TxRmtDriver::new(peripherals.rmt.channel0, peripherals.pins.gpio8, &config)?;
-    let timings_ws2812 = [350, 800, 700, 600];
-    let onboard_led_state = Arc::new(Mutex::new(Vec::with_capacity(1)));
-    onboard_led_state.lock().unwrap().push(Rgb::new(8, 0, 0));
+    // // Onboard RGB LED pin
+    // println!("Registering onboard led channel");
+    // let mut tx_onboard = TxChannelDriver::new(peripherals.pins.gpio8, &config)?;
+    // let timings_ws2812 = [350, 800, 700, 600];
+    // let onboard_led_state = Arc::new(Mutex::new(Vec::with_capacity(1)));
+    //
+    // onboard_led_state.lock().unwrap().push(Rgb::new(8, 0, 0));
+    // send_led_signal(
+    //     &onboard_led_state.lock().unwrap(),
+    //     &mut tx_onboard,
+    //     &timings_ws2812,
+    // )?;
 
     // RGB Stripe pin
-    let mut tx_stripe =
-        TxRmtDriver::new(peripherals.rmt.channel1, peripherals.pins.gpio9, &config)?;
-
+    println!("Registering rgb stripe channel");
+    let mut tx_stripe = TxChannelDriver::new(peripherals.pins.gpio9, &config)?;
     let timings_ws2812b = [400, 800, 850, 450];
     let rgb_stripe_state = Arc::new(Mutex::new(Vec::with_capacity(50)));
 
@@ -85,21 +96,22 @@ pub fn run_main() -> Result<()> {
     send_led_signal(
         &rgb_stripe_state.lock().unwrap(),
         &mut tx_stripe,
-        &timings_ws2812,
+        &timings_ws2812b,
     )?;
 
+    println!("Connecting to wifi");
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
         sys_loop,
     )?;
     connect_wifi(&mut wifi)?;
 
-    onboard_led_state.lock().unwrap()[0] = Rgb::new(8, 0, 4);
-    send_led_signal(
-        &onboard_led_state.lock().unwrap(),
-        &mut tx_onboard,
-        &timings_ws2812,
-    )?;
+    // onboard_led_state.lock().unwrap()[0] = Rgb::new(8, 0, 4);
+    // send_led_signal(
+    //     &onboard_led_state.lock().unwrap(),
+    //     &mut tx_onboard,
+    //     &timings_ws2812,
+    // )?;
 
     core::mem::forget(wifi);
 
@@ -109,17 +121,19 @@ pub fn run_main() -> Result<()> {
         &timings_ws2812b,
     )?;
 
-    let onboard_led_clone = onboard_led_state.clone();
+    // let onboard_led_clone = onboard_led_state.clone();
     let rgb_stripe_clone = rgb_stripe_state.clone();
 
-    let _server = create_udp_server(
-        onboard_led_clone,
-        rgb_stripe_clone,
-        tx_onboard,
-        tx_stripe,
-        timings_ws2812,
-        timings_ws2812b,
-    );
+    // let _server = create_udp_server(
+    //     onboard_led_clone,
+    //     rgb_stripe_clone,
+    //     tx_onboard,
+    //     tx_stripe,
+    //     timings_ws2812,
+    //     timings_ws2812b,
+    // );
+
+    let _server = create_udp_server(rgb_stripe_clone, tx_stripe, timings_ws2812b);
 
     loop {
         FreeRtos::delay_ms(50);
@@ -127,11 +141,8 @@ pub fn run_main() -> Result<()> {
 }
 
 fn create_udp_server(
-    onboard_led_state_lock: Arc<Mutex<Vec<Rgb>>>,
     rgb_stripe_state_lock: Arc<Mutex<Vec<Rgb>>>,
-    mut tx_onboard: TxRmtDriver,
-    mut tx_stripe: TxRmtDriver,
-    timings_ws2812: [u64; 4],
+    mut tx_stripe: TxChannelDriver,
     timings_ws2812b: [u64; 4],
 ) -> Result<(), anyhow::Error> {
     let addr = "0.0.0.0:5568".to_socket_addrs()?.next().unwrap();
@@ -139,12 +150,12 @@ fn create_udp_server(
 
     info!("Created UDP server on {}", addr);
 
-    onboard_led_state_lock.lock().unwrap()[0] = Rgb::new(0, 0, 8);
-    send_led_signal(
-        &onboard_led_state_lock.lock().unwrap(),
-        &mut tx_onboard,
-        &timings_ws2812,
-    )?;
+    // onboard_led_state_lock.lock().unwrap()[0] = Rgb::new(0, 0, 8);
+    // send_led_signal(
+    //     &onboard_led_state_lock.lock().unwrap(),
+    //     &mut tx_onboard,
+    //     &timings_ws2812,
+    // )?;
 
     loop {
         let mut buf = [0u8; 638];
@@ -201,15 +212,30 @@ fn create_udp_server(
     }
 }
 
-fn send_led_signal(rgb: &[Rgb], tx: &mut TxRmtDriver, timings: &[u64; 4]) -> Result<()> {
-    let ticks_hz = tx.counter_clock()?;
+fn send_led_signal(rgb: &[Rgb], tx: &mut TxChannelDriver, timings: &[u64; 4]) -> Result<()> {
     let (t0h, t0l, t1h, t1l) = (
-        Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(timings[0]))?,
-        Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(timings[1]))?,
-        Pulse::new_with_duration(ticks_hz, PinState::High, &Duration::from_nanos(timings[2]))?,
-        Pulse::new_with_duration(ticks_hz, PinState::Low, &Duration::from_nanos(timings[3]))?,
+        Pulse::new_with_duration(
+            RMT_RESOLUTION,
+            PinState::High,
+            Duration::from_nanos(timings[0]),
+        )?,
+        Pulse::new_with_duration(
+            RMT_RESOLUTION,
+            PinState::Low,
+            Duration::from_nanos(timings[1]),
+        )?,
+        Pulse::new_with_duration(
+            RMT_RESOLUTION,
+            PinState::High,
+            Duration::from_nanos(timings[2]),
+        )?,
+        Pulse::new_with_duration(
+            RMT_RESOLUTION,
+            PinState::Low,
+            Duration::from_nanos(timings[3]),
+        )?,
     );
-    let mut signal = VariableLengthSignal::new();
+    let mut signal = Vec::new();
     for color in rgb {
         // Convert RGB to u32 color value
         let color: u32 = color.into();
@@ -218,11 +244,28 @@ fn send_led_signal(rgb: &[Rgb], tx: &mut TxRmtDriver, timings: &[u64; 4]) -> Res
             let p = 2_u32.pow(i);
             let bit: bool = p & color != 0;
             let (high_pulse, low_pulse) = if bit { (t1h, t1l) } else { (t0h, t0l) };
-            signal.push(&[high_pulse, low_pulse])?;
+            signal.push(Symbol::new(high_pulse, low_pulse));
         }
     }
 
-    tx.start_blocking(&signal)?;
+    signal.extend(
+        Symbol::new(
+            Pulse::new(PinState::Low, PulseTicks::max()),
+            Pulse::new(PinState::Low, PulseTicks::max()),
+        )
+        .repeat_for(RMT_RESOLUTION, DELAY_DURATION),
+    );
+
+    let encoder = CopyEncoder::new()?;
+    tx.send_and_wait(
+        encoder,
+        &signal,
+        &TransmitConfig {
+            loop_count: Loop::None,
+            ..Default::default()
+        },
+    )?;
+
     Ok(())
 }
 #[derive(Copy, Clone)]
@@ -288,7 +331,7 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
     let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
         ssid: SSID.try_into().unwrap(),
         bssid: None,
-        auth_method: AuthMethod::WPA2Personal,
+        auth_method: AuthMethod::WPA2WPA3Personal,
         password: PASSWORD.try_into().unwrap(),
         channel: None,
         ..Default::default()
