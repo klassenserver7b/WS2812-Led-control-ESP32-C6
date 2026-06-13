@@ -24,9 +24,9 @@ default = []
 experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
-esp-idf-svc = "0.51"
-esp-idf-hal = { version = "0.45.2", features = ["rmt-legacy"]}
-embedded-svc = "0.28.1"
+esp-idf-svc = "0.52.1"
+esp-idf-hal = { version = "0.46.2", features = ["rmt-legacy"]}
+embedded-svc = "0.29.0"
 anyhow = "1.0.98"
 log = "0.4.27"
 

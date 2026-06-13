@@ -5,20 +5,20 @@
 #![allow(unexpected_cfgs)]
 
 use std::net::{ToSocketAddrs, UdpSocket};
-use std::sync::{Arc, RwLock};
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{env, thread};
 
 use anyhow::{bail, Result};
-use esp_idf_hal::rmt::VariableLengthSignal;
 use esp_idf_hal::{
     delay::FreeRtos,
-    prelude::Peripherals,
-    rmt::{config::TransmitConfig, PinState, Pulse, TxRmtDriver},
+    rmt::{config::TransmitConfig, PinState, Pulse},
 };
 
 use embedded_svc::wifi::AuthMethod;
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
+use esp_idf_hal::peripherals::Peripherals;
+use esp_idf_hal::rmt::{TxRmtDriver, VariableLengthSignal};
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     nvs::EspDefaultNvsPartition,
@@ -64,26 +64,27 @@ pub fn run_main() -> Result<()> {
     let mut tx_onboard =
         TxRmtDriver::new(peripherals.rmt.channel0, peripherals.pins.gpio8, &config)?;
     let timings_ws2812 = [350, 800, 700, 600];
-    let onboard_led_state = Arc::new(RwLock::new(Vec::with_capacity(1)));
-    onboard_led_state.write().unwrap().push(Rgb::new(8, 0, 0));
+    let onboard_led_state = Arc::new(Mutex::new(Vec::with_capacity(1)));
+    onboard_led_state.lock().unwrap().push(Rgb::new(8, 0, 0));
 
     // RGB Stripe pin
-    let mut tx_stripe = TxRmtDriver::new(peripherals.rmt.channel1, peripherals.pins.gpio9, &config)?;
+    let mut tx_stripe =
+        TxRmtDriver::new(peripherals.rmt.channel1, peripherals.pins.gpio9, &config)?;
 
     let timings_ws2812b = [400, 800, 850, 450];
-    let rgb_stripe_state = Arc::new(RwLock::new(Vec::with_capacity(50)));
+    let rgb_stripe_state = Arc::new(Mutex::new(Vec::with_capacity(50)));
 
     // cyan at 100% brightness
     for _ in 0..50 {
         rgb_stripe_state
-            .write()
+            .lock()
             .unwrap()
             .push(Rgb::from_hsv(150, 100, 13)?);
     }
 
     send_led_signal(
-        &onboard_led_state.read().unwrap(),
-        &mut tx_onboard,
+        &rgb_stripe_state.lock().unwrap(),
+        &mut tx_stripe,
         &timings_ws2812,
     )?;
 
@@ -93,9 +94,9 @@ pub fn run_main() -> Result<()> {
     )?;
     connect_wifi(&mut wifi)?;
 
-    onboard_led_state.write().unwrap()[0] = Rgb::new(8, 0, 4);
+    onboard_led_state.lock().unwrap()[0] = Rgb::new(8, 0, 4);
     send_led_signal(
-        &onboard_led_state.read().unwrap(),
+        &onboard_led_state.lock().unwrap(),
         &mut tx_onboard,
         &timings_ws2812,
     )?;
@@ -103,7 +104,7 @@ pub fn run_main() -> Result<()> {
     core::mem::forget(wifi);
 
     send_led_signal(
-        &rgb_stripe_state.read().unwrap(),
+        &rgb_stripe_state.lock().unwrap(),
         &mut tx_stripe,
         &timings_ws2812b,
     )?;
@@ -111,14 +112,14 @@ pub fn run_main() -> Result<()> {
     let onboard_led_clone = onboard_led_state.clone();
     let rgb_stripe_clone = rgb_stripe_state.clone();
 
-    let _server = create_udp_server(
-        onboard_led_clone,
-        rgb_stripe_clone,
-        tx_onboard,
-        tx_stripe,
-        timings_ws2812,
-        timings_ws2812b,
-    );
+    // let _server = create_udp_server(
+    //     onboard_led_clone,
+    //     rgb_stripe_clone,
+    //     tx_onboard,
+    //     tx_stripe,
+    //     timings_ws2812,
+    //     timings_ws2812b,
+    // );
 
     loop {
         FreeRtos::delay_ms(50);
@@ -126,8 +127,8 @@ pub fn run_main() -> Result<()> {
 }
 
 fn create_udp_server(
-    onboard_led_state_lock: Arc<RwLock<Vec<Rgb>>>,
-    rgb_stripe_state_lock: Arc<RwLock<Vec<Rgb>>>,
+    onboard_led_state_lock: Arc<Mutex<Vec<Rgb>>>,
+    rgb_stripe_state_lock: Arc<Mutex<Vec<Rgb>>>,
     mut tx_onboard: TxRmtDriver,
     mut tx_stripe: TxRmtDriver,
     timings_ws2812: [u64; 4],
@@ -138,9 +139,9 @@ fn create_udp_server(
 
     info!("Created UDP server on {}", addr);
 
-    onboard_led_state_lock.write().unwrap()[0] = Rgb::new(0, 0, 8);
+    onboard_led_state_lock.lock().unwrap()[0] = Rgb::new(0, 0, 8);
     send_led_signal(
-        &onboard_led_state_lock.read().unwrap(),
+        &onboard_led_state_lock.lock().unwrap(),
         &mut tx_onboard,
         &timings_ws2812,
     )?;
@@ -169,7 +170,7 @@ fn create_udp_server(
         let property_values = &buf[125..(125 + property_value_count as usize)];
 
         {
-            let mut rgb_stripe_state = rgb_stripe_state_lock.write().unwrap();
+            let mut rgb_stripe_state = rgb_stripe_state_lock.lock().unwrap();
             info!(
                 "updating rgb leds based on universe {} from {}",
                 universe, addr
@@ -191,7 +192,7 @@ fn create_udp_server(
         info!("updating rgb stripe color");
 
         send_led_signal(
-            &rgb_stripe_state_lock.read().unwrap(),
+            &rgb_stripe_state_lock.lock().unwrap(),
             &mut tx_stripe,
             &timings_ws2812b,
         )?;
